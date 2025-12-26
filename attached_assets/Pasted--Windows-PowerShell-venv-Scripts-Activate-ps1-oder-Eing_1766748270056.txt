@@ -1,0 +1,51 @@
+# Windows PowerShell
+.\.venv\Scripts\Activate.ps1
+# oder Eingabeaufforderung
+.\.venv\Scripts\activate.bat
+
+python -m pip install --upgrade pip
+python -m pip install Flask
+Starte danach dein Script innerhalb des aktivierten Environments:
+
+bash
+python main.py
+4) Falls du pip-Fehler siehst
+Nutze python -m pip statt pip, das vermeidet Verwechslungen:
+
+bash
+python -m pip install Flask
+Prüfen, ob Installation erfolgreich war
+Im Terminal:
+
+bash
+python -c "import flask; print(flask.__version__)"
+Wenn eine Versionsnummer erscheint, ist Flask korrekt installiert.
+
+Häufige Ursachen und Lösungen
+Mehrere Python‑Installationen: Du hast z. B. System‑Python und eine andere Installation; pip installiert in einer anderen Version. Lösung: immer python -m pip verwenden oder den vollen Pfad zum Interpreter.
+
+Virtualenv nicht aktiviert: Du hast Flask in .venv installiert, aber das Environment nicht aktiviert. Aktiviere es vor dem Start.
+
+IDE‑Interpreter falsch gesetzt: Wenn du VS Code, PyCharm o. Ä. nutzt, stelle sicher, dass das Projekt‑Interpreter auf das Environment zeigt, in dem Flask installiert ist.
+
+Rechte/Proxy: Bei Firmen‑PCs kann die Installation durch Proxy/Firewall blockiert werden. Prüfe Fehlermeldungen beim pip install.
+
+Wenn du Docker oder Production nutzt
+In Dockerfile: füge RUN pip install Flask oder COPY requirements.txt + RUN pip install -r requirements.txt.
+
+In Production: verwende ein dediziertes virtualenv oder Systemd‑Service, das den richtigen Interpreter nutzt.
+
+Kurz‑Checkliste zum Abhaken
+[ ] python --version und sys.executable prüfen
+
+[ ] python -m pip install Flask ausführen
+
+[ ] python -c "import flask; print(flask.__version__)" erfolgreich?
+
+[ ] Falls mehrere Pythons: Pfad zum Interpreter verwenden
+
+[ ] Virtualenv erstellen und aktivieren (empfohlen)
+
+[ ] IDE‑Interpreter auf das Environment setzen
+
+Wenn du willst, erstelle ich dir jetzt die exakten Befehle, angepasst an deinen sys.executable‑Pfad (kopierbar), oder ich zeige dir, wie du in VS Code das richtige Interpreter/Environment einstellst. Sag mir kurz: „Befehle an meinen Interpreter anpassen“ oder „VS Code Interpreter einstellen“, dann liefere ich die passenden Schritte.
