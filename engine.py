@@ -53,7 +53,7 @@ def execute_problem(problem_id):
             response = openai_client.chat.completions.create(
                 model="gpt-5",
                 messages=[
-                    {"role": "system", "content": f"You are an AI operator performing step: {operator.name}. Description: {operator.description}"},
+                    {"role": "system", "content": f"You are an AI operator performing step: {operator.name}. Description: {operator.description}. Return output in JSON format."},
                     {"role": "user", "content": f"Input data: {current_payload}"}
                 ],
                 response_format={ "type": "json_object" }
@@ -66,11 +66,10 @@ def execute_problem(problem_id):
         problem.updated_at = datetime.utcnow()
         
         # Book revenue
-        rev = RevenueEntry(
-            id=str(uuid.uuid4()),
-            problem_id=problem.id,
-            amount=problem.price
-        )
+        rev = RevenueEntry()
+        rev.id = str(uuid.uuid4())
+        rev.problem_id = problem.id
+        rev.amount = problem.price
         db.session.add(rev)
         db.session.commit()
 
