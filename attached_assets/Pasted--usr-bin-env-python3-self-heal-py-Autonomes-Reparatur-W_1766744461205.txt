@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""
+self_heal.py
+Autonomes Reparatur‑Werkzeug (lokal). Kopiere in dein Projekt und führe aus:
+    python self_heal.py /pfad/zu/deinem/projekt
+"""
+import sys
+import os
+import io
+import time
+import json
+import shutil
+import py_compile
+import traceback
+from lib2to3.refactor import RefactoringTool, get_fixers_from_package
+from ast import parse, walk, Import, ImportFrom
+
+LOGFILE = "self_heal.log"
+
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} {msg}"
+    print(line)
+    with open(LOGFILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+# --- simple normalizations ---
+SMART_QUOTES = {
+    "\u2018": "'", "\u2019": "'", "\u201C": '"', "\u201D": '"',
+    "\u201E": '"', "\u201A": "'", "\u201B": "'",
+    "\u00A0": " ",  # NBSP
+}
+
+def normalize_text(s: str) -> str:
+    # replace smart quotes and NBSP
+    for k, v in SMART_QUOTES.items():
+        s = s.replace(k, v)
+    # normalize CRLF -> LF
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    # convert tabs to 4 spaces
+    s = s.replace("\t", " " * 4)
+    # strip trailing whitespace on lines
+    s = "\n".join(line.rstrip() for line in s.split("\n"))
+    return s
+
+# --- lib2to3 refactor tool (safe defaults) ---
+FIXERS = get_fixers_from_package("lib2to3.fixes")
+REF = RefactoringTool(FIXERS)
+
+def lib2to3_fix(source: str) -> str:
+    try:
+        tree = REF.refactor_string(source, name="auto")
+        return str(tree)
+    except Exception:
+        return source
+
+# --- parse imports to create placeholders for missing local modules ---
+def find_local_imports(source: str):
+    mods = set()
+    try:
+        tree = parse(source)
+    except Exception:
+        return mods
+    for node in walk(tree):
+        if isinstance(node, Import):
+            for n in node.names:
+                name = n.name.split(".")[0]
+                mods.add(name)
+        elif isinstance(node, ImportFrom):
+            if node.module:
+                name = node.module.split(".")[0]
+                mods.add(name)
+    return mods
+
+def is_local_module(name: str, project_root: str):
+    # consider local if a .py file or package dir exists in project root
+    py = os.path.join(project_root, f"{name}.py")
+    pkg = os.path.join(project_root, name)
+    return os.path.exists(py) or os.path.isdir(pkg)
+
+# --- main file repair routine ---
+def repair_file(path: str, project_root: str) -> dict:
+    result = {"path": path, "changed": False, "errors_before": None, "errors_after": None, "placeholders": []}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            src = f.read()
+    except Exception as e:
+        result["errors_before"] = f"read_error: {e}"
+        return result
+
+    # first: syntax check
+    try:
+        py_compile.compile(path, doraise=True)
+    except py_compile.PyCompileError as e:
+        result["errors_before"] = str(e)
+    except Exception as e:
+        result["errors_before"] = str(e)
+
+    # apply normalizations
+    new_src = normalize_text(src)
+
+    # try lib2to3 fixes
+    new_src2 = lib2to3_fix(new_src)
+
+    # if changed, backup and write
+    if new_src2 != src:
+        bak = path + ".bak"
+        try:
+            if not os.path.exists(bak):
+                shutil.copy2(path, bak)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(new_src2)
+            result["changed"] = True
+            log(f"Repaired and wrote {path} (backup: {bak})")
+        except Exception as e:
+            result["errors_after"] = f"write_error: {e}"
+            return result
+
+    # re-check syntax after modifications
+    try:
+        py_compile.compile(path, doraise=True)
+    except py_compile.PyCompileError as e:
+        result["errors_after"] = str(e)
+    except Exception as e:
+        result["errors_after"] = str(e)
+
+    # create placeholders for local imports that are missing
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            final_src = f.read()
+        imports = find_local_imports(final_src)
+        for mod in imports:
+            if mod in ("sys", "os", "json", "re", "math", "time", "typing", "dataclasses", "threading", "sqlite3"):
+                continue
+            if not is_local_module(mod, project_root):
+                # create placeholder module file
+                placeholder_path = os.path.join(project_root, f"{mod}.py")
+                if not os.path.exists(placeholder_path):
+                    with open(placeholder_path, "w", encoding="utf-8") as ph:
+                        ph.write("# Auto-generated placeholder module for missing import\n")
+                        ph.write(f"# Module: {mod}\n")
+                        ph.write("def _placeholder():\n    return None\n")
+                    result["placeholders"].append(placeholder_path)
+                    log(f"Created placeholder module: {placeholder_path}")
+    except Exception as e:
+        log(f"Error while creating placeholders for {path}: {e}")
+
+    return result
+
+# --- walk project and repair ---
+def repair_project(root: str):
+    summary = {"files": 0, "changed": 0, "placeholders": 0, "errors": []}
+    py_files = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        # skip virtualenvs and .git
+        if any(part in (".git", "venv", "env", "__pycache__") for part in dirpath.split(os.sep)):
+            continue
+        for fn in filenames:
+            if fn.endswith(".py"):
+                py_files.append(os.path.join(dirpath, fn))
+    log(f"Found {len(py_files)} python files under {root}")
+    for p in py_files:
+        summary["files"] += 1
+        try:
+            res = repair_file(p, root)
+            if res.get("changed"):
+                summary["changed"] += 1
+            if res.get("placeholders"):
+                summary["placeholders"] += len(res["placeholders"])
+            if res.get("errors_after"):
+                summary["errors"].append({"file": p, "error": res["errors_after"]})
+        except Exception as e:
+            summary["errors"].append({"file": p, "error": str(e)})
+    return summary
+
+# --- entrypoint ---
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python self_heal.py /path/to/project_or_file")
+        sys.exit(1)
+    target = sys.argv[1]
+    if not os.path.exists(target):
+        print("Path not found:", target)
+        sys.exit(1)
+    start = time.time()
+    log(f"SELF_HEAL START target={target}")
+    if os.path.isfile(target) and target.endswith(".py"):
+        root = os.path.dirname(os.path.abspath(target))
+        summary = {"files": 1}
+        res = repair_file(os.path.abspath(target), root)
+        summary.update(res)
+    else:
+        root = os.path.abspath(target)
+        summary = repair_project(root)
+    elapsed = time.time() - start
+    log(f"SELF_HEAL DONE elapsed={elapsed:.2f}s summary={json.dumps(summary)}")
+    print("Summary:", summary)
+    if summary.get("errors"):
+        print("Remaining syntax errors found in files. Inspect .bak files and self_heal.log for details.")
+    else:
+        print("No remaining syntax errors detected by py_compile.")
+    print("Log:", os.path.abspath(LOGFILE))
+
+if __name__ == "__main__":
+    main()

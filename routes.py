@@ -83,3 +83,4 @@ def bootstrap():
 def revenue_summary():
     total = db.session.query(db.func.sum(RevenueEntry.amount)).scalar() or 0.0
     return jsonify({"total_revenue": total})
+ 

@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""
+setup_assistant.py
+
+Sicheres, interaktives Setup-Assistenzskript.
+- Führt keine unbeaufsichtigten Systemänderungen durch.
+- Zeigt Befehle, prüft Umgebung, führt nur nach Bestätigung aus.
+- Speichert Fortschritt in state.json (idempotent).
+- Dry-run möglich: python setup_assistant.py --dry
+"""
+
+import os
+import sys
+import json
+import shutil
+import subprocess
+import time
+from typing import Dict, Any, List
+
+STATE_FILE = "setup_state.json"
+LOG_FILE = "setup_assistant.log"
+
+# -------------------------
+# Utilities
+# -------------------------
+def log(msg: str):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} {msg}"
+    print(line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def load_state() -> Dict[str, Any]:
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_state(state: Dict[str, Any]):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
+
+def confirm(prompt: str) -> bool:
+    ans = input(f"{prompt} [y/N]: ").strip().lower()
+    return ans in ("y", "yes")
+
+def run_command(cmd: List[str], dry: bool = True) -> int:
+    """Run a command safely (no shell). Returns exit code. In dry-run mode, only prints."""
+    log(f"COMMAND: {' '.join(cmd)} (dry={dry})")
+    if dry:
+        print("DRY RUN: command not executed.")
+        return 0
+    try:
+        res = subprocess.run(cmd, check=False)
+        return res.returncode
+    except Exception as e:
+        log(f"Command failed: {e}")
+        return 1
+
+def which(cmd: str) -> str:
+    return shutil.which(cmd) or ""
+
+# -------------------------
+# Environment Checks
+# -------------------------
+def check_python_version(min_major=3, min_minor=8) -> bool:
+    v = sys.version_info
+    ok = (v.major > min_major) or (v.major == min_major and v.minor >= min_minor)
+    log(f"Python version: {v.major}.{v.minor}.{v.micro} -> ok={ok}")
+    return ok
+
+def check_free_space_mb(path="/") -> int:
+    st = shutil.disk_usage(path)
+    mb = st.free // (1024*1024)
+    log(f"Free space at {path}: {mb} MB")
+    return mb
+
+def detect_package_managers() -> Dict[str, str]:
+    pm = {}
+    for name in ("apt-get", "yum", "dnf", "pacman", "brew"):
+        p = which(name)
+        if p:
+            pm[name] = p
+    log(f"Detected package managers: {pm}")
+    return pm
+
+# -------------------------
+# Task primitives
+# -------------------------
+def task_check_env(state: Dict[str, Any], dry: bool) -> bool:
+    key = "env_checked"
+    if state.get(key):
+        log("Environment already checked.")
+        return True
+    ok = True
+    if not check_python_version():
+        log("Warning: Python version is below recommended minimum (3.8).")
+        ok = False
+    free_mb = check_free_space_mb()
+    if free_mb < 200:
+        log("Warning: Less than 200MB free disk space.")
+        ok = False
+    pms = detect_package_managers()
+    state[key] = {"ok": ok, "package_managers": pms}
+    save_state(state)
+    return ok
+
+def task_install_system_package(state: Dict[str, Any], dry: bool, package: str) -> bool:
+    """
+    Installs a system package using detected package manager.
+    This function will:
+    - detect package manager
+    - show the exact command
+    - ask for confirmation
+    - execute only if user confirms and dry==False
+    """
+    key = f"syspkg:{package}"
+    if state.get(key):
+        log(f"System package '{package}' already installed/attempted.")
+        return True
+    pms = state.get("env_checked", {}).get("package_managers", {})
+    if not pms:
+        pms = detect_package_managers()
+    if "apt-get" in pms:
+        cmd = ["sudo", "apt-get", "update", "&&", "sudo", "apt-get", "install", "-y", package]
+        # We avoid shell operators in run_command; show combined command and ask user to run if they want
+        print(f"Suggested command (Debian/Ubuntu): sudo apt-get update && sudo apt-get install -y {package}")
+        if confirm("Execute this command now (will run via shell if you confirm)?"):
+            if dry:
+                log("Dry-run: not executing apt-get.")
+                state[key] = {"attempted": True, "dry": True}
+                save_state(state)
+                return True
+            # execute via shell for combined commands
+            rc = subprocess.call("sudo apt-get update && sudo apt-get install -y {}".format(package), shell=True)
+            state[key] = {"attempted": True, "rc": rc}
+            save_state(state)
+            return rc == 0
+        else:
+            log("User declined apt-get execution.")
+            return False
+    elif "brew" in pms:
+        cmd = ["brew", "install", package]
+        print(f"Suggested command (Homebrew): {' '.join(cmd)}")
+        if confirm("Execute this command now?"):
+            rc = run_command(cmd, dry=dry)
+            state[key] = {"attempted": True, "rc": rc}
+            save_state(state)
+            return rc == 0
+        else:
+            return False
+    else:
+        print("No supported system package manager detected. Please install manually:")
+        print(f"  - {package}")
+        state[key] = {"attempted": False, "reason": "no_pm"}
+        save_state(state)
+        return False
+
+def task_install_pip_package(state: Dict[str, Any], dry: bool, package: str) -> bool:
+    key = f"pippkg:{package}"
+    if state.get(key):
+        log(f"Pip package '{package}' already installed/attempted.")
+        return True
+    cmd = [sys.executable, "-m", "pip", "install", package]
+    print("Suggested pip command:", " ".join(cmd))
+    if confirm("Execute pip install now?"):
+        rc = run_command(cmd, dry=dry)
+        state[key] = {"attempted": True, "rc": rc}
+        save_state(state)
+        return rc == 0
+    else:
+        log("User declined pip install.")
+        return False
+
+def task_create_placeholder_file(state: Dict[str, Any], dry: bool, relpath: str, content: str = "# placeholder\n"):
+    key = f"placeholder:{relpath}"
+    if state.get(key):
+        log(f"Placeholder {relpath} already created.")
+        return True
+    full = os.path.abspath(relpath)
+    if os.path.exists(full):
+        log(f"File {relpath} already exists.")
+        state[key] = {"created": False, "reason": "exists"}
+        save_state(state)
+        return False
+    print(f"Will create placeholder file: {relpath}")
+    if confirm("Create file now?"):
+        if dry:
+            log("Dry-run: not creating file.")
+            state[key] = {"created": False, "dry": True}
+            save_state(state)
+            return True
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+        state[key] = {"created": True}
+        save_state(state)
+        log(f"Created placeholder {relpath}")
+        return True
+    else:
+        log("User declined placeholder creation.")
+        return False
+
+# -------------------------
+# High-level orchestrator
+# -------------------------
+def orchestrate(dry: bool = True):
+    state = load_state()
+    log(f"Starting orchestration (dry={dry})")
+    # 1) environment check
+    ok_env = task_check_env(state, dry)
+    if not ok_env:
+        print("Environment checks raised warnings. Review logs and confirm to continue.")
+        if not confirm("Continue despite warnings?"):
+            log("User aborted after env warnings.")
+            return
+
+    # 2) example: ensure git is installed
+    task_install_system_package(state, dry, "git")
+
+    # 3) ensure pip packages needed
+    for pkg in ("requests", "pydantic"):
+        task_install_pip_package(state, dry, pkg)
+
+    # 4) create placeholder module if project expects it (example)
+    task_create_placeholder_file(state, dry, "local_module.py", content="# Auto-generated placeholder\n")
+
+    # 5) final summary
+    log("Orchestration finished. State snapshot:")
+    print(json.dumps(state, indent=2))
+
+# -------------------------
+# CLI
+# -------------------------
+def print_help():
+    print("Usage: python setup_assistant.py [--run] [--dry]")
+    print("  --dry   : show actions but do not execute (default)")
+    print("  --run   : allow execution (will still ask for confirmation before each action)")
+
+if __name__ == "__main__":
+    dry = True
+    if "--run" in sys.argv:
+        dry = False
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print_help()
+        sys.exit(0)
+    orchestrate(dry=dry)

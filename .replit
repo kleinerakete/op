@@ -42,6 +42,25 @@ waitForPort = 5000
 [workflows.workflow.metadata]
 outputType = "webview"
 
+[[workflows.workflow]]
+name = "c"
+mode = "parallel"
+author = 51817703
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Project"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Run Application"
+
 [[ports]]
 localPort = 5000
 externalPort = 80
+
+[objectStorage]
+defaultBucketID = "replit-objstore-6c8bd846-b7f5-4302-85af-e6ee773c5330"
