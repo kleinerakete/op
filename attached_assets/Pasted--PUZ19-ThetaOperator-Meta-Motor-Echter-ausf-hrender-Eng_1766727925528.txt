@@ -1,0 +1,442 @@
+"""
+PUZ19 / ThetaOperator Meta-Motor
+--------------------------------
+Echter, ausführender Engine-Motor mit:
+- Problem-Intake
+- Flow-/Operator-Registry
+- Dynamischer Preisberechnung
+- Payment-Gate (ohne echtes Gateway, aber realer Kontrollfluss)
+- Direkter Execution nach Payment
+- Revenue-Tracking
+- Admin-API für Flows, Operatoren, Probleme, Revenue
+
+Run:
+    pip install fastapi uvicorn
+    uvicorn motor:app --reload
+
+Dann:
+    POST  /admin/operators       -> Worker registrieren
+    POST  /admin/flows           -> Flow definieren
+    POST  /problems              -> Problem anlegen (führt Pricing aus)
+    POST  /payments/{id}/confirm -> Payment bestätigen -> echte Execution
+    GET   /revenue/summary       -> Einnahmen ansehen
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Dict, List, Callable, Any, Optional
+from enum import Enum
+from uuid import uuid4
+from datetime import datetime
+
+app = FastAPI(title="ThetaOperator Meta-Motor", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==============================
+#   Core Domain Models
+# ==============================
+
+class ProblemStatus(str, Enum):
+    INTAKE = "INTAKE"
+    PRICED = "PRICED"
+    PENDING_PAYMENT = "PENDING_PAYMENT"
+    PAID = "PAID"
+    EXECUTING = "EXECUTING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+class PaymentStatus(str, Enum):
+    NONE = "NONE"
+    REQUIRED = "REQUIRED"
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
+
+class EventType(str, Enum):
+    PROBLEM_CREATED = "PROBLEM_CREATED"
+    PRICED = "PRICED"
+    PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
+    PAYMENT_CONFIRMED = "PAYMENT_CONFIRMED"
+    EXECUTION_STARTED = "EXECUTION_STARTED"
+    EXECUTION_COMPLETED = "EXECUTION_COMPLETED"
+    EXECUTION_FAILED = "EXECUTION_FAILED"
+    REVENUE_BOOKED = "REVENUE_BOOKED"
+
+class Problem(BaseModel):
+    id: str
+    type: str
+    payload: dict
+    context: dict = {}
+    status: ProblemStatus = ProblemStatus.INTAKE
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    price: float = 0.0
+    payment_status: PaymentStatus = PaymentStatus.NONE
+    flow_name: Optional[str] = None
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+class OperatorSpec(BaseModel):
+    name: str
+    description: str = ""
+    input_type: str = "generic"
+    output_type: str = "generic"
+
+class FlowStep(BaseModel):
+    operator_name: str
+    description: str = ""
+
+class Flow(BaseModel):
+    name: str
+    problem_type: str
+    base_price: float = 10.0
+    price_per_complexity: float = 1.0
+    steps: List[FlowStep]
+
+class Event(BaseModel):
+    id: str
+    timestamp: datetime
+    type: EventType
+    entity_id: str
+    data: dict = {}
+
+class RevenueEntry(BaseModel):
+    id: str
+    problem_id: str
+    amount: float
+    currency: str = "EUR"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class RevenueSummary(BaseModel):
+    total_revenue: float
+    currency: str
+    count: int
+
+# ==============================
+#   In-Memory Stores
+# ==============================
+
+PROBLEMS: Dict[str, Problem] = {}
+FLOWS: Dict[str, Flow] = {}
+OPERATORS: Dict[str, OperatorSpec] = {}
+OPERATOR_IMPL: Dict[str, Callable[[dict], dict]] = {}
+EVENTS: List[Event] = []
+REVENUE: List[RevenueEntry] = []
+
+# ==============================
+#   Event & Revenue Helpers
+# ==============================
+
+def emit_event(event_type: EventType, entity_id: str, data: dict = None):
+    ev = Event(
+        id=str(uuid4()),
+        timestamp=datetime.utcnow(),
+        type=event_type,
+        entity_id=entity_id,
+        data=data or {}
+    )
+    EVENTS.append(ev)
+    return ev
+
+def book_revenue(problem_id: str, amount: float, currency: str = "EUR") -> RevenueEntry:
+    entry = RevenueEntry(
+        id=str(uuid4()),
+        problem_id=problem_id,
+        amount=amount,
+        currency=currency
+    )
+    REVENUE.append(entry)
+    emit_event(EventType.REVENUE_BOOKED, problem_id, {"amount": amount, "currency": currency})
+    return entry
+
+def compute_revenue_summary(currency: str = "EUR") -> RevenueSummary:
+    relevant = [r for r in REVENUE if r.currency == currency]
+    total = sum(r.amount for r in relevant)
+    return RevenueSummary(total_revenue=total, currency=currency, count=len(relevant))
+
+# ==============================
+#   Admin: Operator & Flow API
+# ==============================
+
+class RegisterOperatorRequest(BaseModel):
+    name: str
+    description: str = ""
+    input_type: str = "generic"
+    output_type: str = "generic"
+    # flag, ob eine eingebaute Worker-Implementierung genutzt werden soll
+    builtin: Optional[str] = None
+
+@app.post("/admin/operators", response_model=OperatorSpec)
+def register_operator(req: RegisterOperatorRequest):
+    if req.name in OPERATORS:
+        raise HTTPException(status_code=400, detail="Operator already exists")
+
+    spec = OperatorSpec(
+        name=req.name,
+        description=req.description,
+        input_type=req.input_type,
+        output_type=req.output_type,
+    )
+    OPERATORS[req.name] = spec
+
+    # einfache eingebaute Worker-Implementierungen (REAL, kein Dummy)
+    if req.builtin:
+        if req.builtin == "echo":
+            def impl(payload: dict) -> dict:
+                return {"echo": payload}
+        elif req.builtin == "text_summary":
+            def impl(payload: dict) -> dict:
+                text = payload.get("text", "")
+                words = text.split()
+                return {
+                    "length": len(text),
+                    "word_count": len(words),
+                    "preview": " ".join(words[:20])
+                }
+        elif req.builtin == "numeric_stats":
+            def impl(payload: dict) -> dict:
+                nums = payload.get("numbers", [])
+                if not nums:
+                    return {"count": 0, "sum": 0, "avg": 0}
+                total = sum(nums)
+                return {"count": len(nums), "sum": total, "avg": total / len(nums)}
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown builtin: {req.builtin}")
+
+        OPERATOR_IMPL[req.name] = impl
+
+    return spec
+
+@app.get("/admin/operators", response_model=List[OperatorSpec])
+def list_operators():
+    return list(OPERATORS.values())
+
+class CreateFlowRequest(BaseModel):
+    name: str
+    problem_type: str
+    base_price: float = 10.0
+    price_per_complexity: float = 1.0
+    steps: List[FlowStep]
+
+@app.post("/admin/flows", response_model=Flow)
+def create_flow(req: CreateFlowRequest):
+    if req.name in FLOWS:
+        raise HTTPException(status_code=400, detail="Flow already exists")
+
+    flow = Flow(
+        name=req.name,
+        problem_type=req.problem_type,
+        base_price=req.base_price,
+        price_per_complexity=req.price_per_complexity,
+        steps=req.steps
+    )
+    # Validierung: alle Operatoren müssen existieren
+    missing = [s.operator_name for s in flow.steps if s.operator_name not in OPERATORS]
+    if missing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown operators in flow: {missing}"
+        )
+
+    FLOWS[flow.name] = flow
+    return flow
+
+@app.get("/admin/flows", response_model=List[Flow])
+def list_flows():
+    return list(FLOWS.values())
+
+# ==============================
+#   Pricing & Flow Selection
+# ==============================
+
+def select_flow_for_problem(problem_type: str) -> Flow:
+    for f in FLOWS.values():
+        if f.problem_type == problem_type:
+            return f
+    raise HTTPException(status_code=400, detail=f"No flow for problem_type={problem_type}")
+
+def compute_price(flow: Flow, payload: dict) -> float:
+    # einfache, aber reale Preislogik:
+    # complexity = Länge des Payloads + (optional) custom "complexity"
+    base_complexity = len(str(payload))
+    extra_complexity = payload.get("complexity", 0)
+    complexity = base_complexity + extra_complexity
+    price = flow.base_price + flow.price_per_complexity * complexity
+    return round(price, 2)
+
+# ==============================
+#   Problem Intake & Payment
+# ==============================
+
+class CreateProblemRequest(BaseModel):
+    type: str
+    payload: dict
+    context: dict = {}
+
+@app.post("/problems", response_model=Problem)
+def create_problem(req: CreateProblemRequest):
+    pid = str(uuid4())
+    flow = select_flow_for_problem(req.type)
+    price = compute_price(flow, req.payload)
+
+    problem = Problem(
+        id=pid,
+        type=req.type,
+        payload=req.payload,
+        context=req.context,
+        status=ProblemStatus.PRICED,
+        price=price,
+        payment_status=PaymentStatus.REQUIRED,
+        flow_name=flow.name,
+    )
+    PROBLEMS[pid] = problem
+    emit_event(EventType.PROBLEM_CREATED, pid, {"type": req.type})
+    emit_event(EventType.PRICED, pid, {"price": price})
+    emit_event(EventType.PAYMENT_REQUIRED, pid, {"price": price})
+
+    return problem
+
+@app.get("/problems/{problem_id}", response_model=Problem)
+def get_problem(problem_id: str):
+    problem = PROBLEMS.get(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail="Problem not found")
+    return problem
+
+class ConfirmPaymentRequest(BaseModel):
+    # hier könntest du später echte Payment-Details integrieren (tx_id, wallet, stripe_id, ...)
+    confirmed: bool = True
+
+@app.post("/payments/{problem_id}/confirm", response_model=Problem)
+def confirm_payment(problem_id: str, req: ConfirmPaymentRequest):
+    problem = PROBLEMS.get(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail="Problem not found")
+
+    if not req.confirmed:
+        problem.payment_status = PaymentStatus.FAILED
+        problem.status = ProblemStatus.FAILED
+        problem.updated_at = datetime.utcnow()
+        emit_event(EventType.EXECUTION_FAILED, problem_id, {"reason": "Payment rejected"})
+        return problem
+
+    problem.payment_status = PaymentStatus.CONFIRMED
+    problem.status = ProblemStatus.PAID
+    problem.updated_at = datetime.utcnow()
+    emit_event(EventType.PAYMENT_CONFIRMED, problem_id, {"price": problem.price})
+
+    # direkt nach bestätigtem Payment: reale Execution starten
+    execute_problem(problem)
+
+    return problem
+
+# ==============================
+#   Execution Engine
+# ==============================
+
+def execute_problem(problem: Problem):
+    if problem.payment_status != PaymentStatus.CONFIRMED:
+        raise HTTPException(status_code=400, detail="Cannot execute unpaid problem")
+
+    flow = FLOWS.get(problem.flow_name or "")
+    if not flow:
+        raise HTTPException(status_code=500, detail="Flow not found for problem")
+
+    problem.status = ProblemStatus.EXECUTING
+    problem.updated_at = datetime.utcnow()
+    emit_event(EventType.EXECUTION_STARTED, problem.id, {"flow": flow.name})
+
+    current_payload = problem.payload
+    try:
+        for step in flow.steps:
+            op_name = step.operator_name
+            if op_name not in OPERATOR_IMPL:
+                raise RuntimeError(f"No implementation for operator {op_name}")
+
+            fn = OPERATOR_IMPL[op_name]
+            # hier wird REAL Arbeit gemacht – kein Dummy:
+            current_payload = fn(current_payload)
+
+        problem.status = ProblemStatus.COMPLETED
+        problem.result = {"output": current_payload}
+        problem.updated_at = datetime.utcnow()
+        emit_event(EventType.EXECUTION_COMPLETED, problem.id, {"result": problem.result})
+
+        # Revenue direkt buchen
+        book_revenue(problem.id, problem.price)
+
+    except Exception as e:
+        problem.status = ProblemStatus.FAILED
+        problem.error = str(e)
+        problem.updated_at = datetime.utcnow()
+        emit_event(EventType.EXECUTION_FAILED, problem.id, {"error": str(e)})
+
+# ==============================
+#   Events & Revenue API
+# ==============================
+
+@app.get("/events", response_model=List[Event])
+def list_events(limit: int = 100):
+    return EVENTS[-limit:]
+
+@app.get("/revenue", response_model=List[RevenueEntry])
+def list_revenue():
+    return REVENUE
+
+@app.get("/revenue/summary", response_model=RevenueSummary)
+def get_revenue_summary(currency: str = "EUR"):
+    return compute_revenue_summary(currency=currency)
+
+# ==============================
+#   Bootstrapping Beispiel
+# ==============================
+
+@app.on_event("startup")
+def bootstrap():
+    """
+    Beim Start direkt einen Flow + Operatoren registrieren,
+    damit du sofort echte Arbeit & Einnahmen hast ohne extra Setup.
+    """
+    # Operatoren registrieren
+    if "puz19_text_summary" not in OPERATORS:
+        register_operator(RegisterOperatorRequest(
+            name="puz19_text_summary",
+            description="Analysiert Text und erzeugt eine einfache Zusammenfassung/Statistik.",
+            input_type="text_problem",
+            output_type="text_summary",
+            builtin="text_summary",
+        ))
+    if "puz19_numeric_stats" not in OPERATORS:
+        register_operator(RegisterOperatorRequest(
+            name="puz19_numeric_stats",
+            description="Berechnet einfache numerische Statistiken.",
+            input_type="numeric_list",
+            output_type="numeric_stats",
+            builtin="numeric_stats",
+        ))
+
+    # Flow für PUZ19 Scientific Text-Analyse
+    if "puz19_scientific_text_flow" not in FLOWS:
+        create_flow(CreateFlowRequest(
+            name="puz19_scientific_text_flow",
+            problem_type="puz19:text_analysis",
+            base_price=25.0,
+            price_per_complexity=0.05,
+            steps=[
+                FlowStep(operator_name="puz19_text_summary", description="Text analysieren"),
+            ]
+        ))
+
+    # Flow für PUZ19 numerische Analyse
+    if "puz19_scientific_numeric_flow" not in FLOWS:
+        create_flow(CreateFlowRequest(
+            name="puz19_scientific_numeric_flow",
+            problem_type="puz19:numeric_analysis",
+            base_price=30.0,
+            price_per_complexity=0.02,

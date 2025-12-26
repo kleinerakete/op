@@ -1,0 +1,378 @@
+"""
+motor_v2.py – Meta-Motor mit Payment-Provider und strikter Transaktionslogik
+
+Run:
+    pip install fastapi uvicorn
+    uvicorn motor_v2:app --reload
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import Dict, List, Callable, Any, Optional
+from enum import Enum
+from uuid import uuid4
+from datetime import datetime
+
+app = FastAPI(title="ThetaOperator Meta-Motor v2", version="2.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==============================
+#   Core Enums & Models
+# ==============================
+
+class ProblemStatus(str, Enum):
+    INTAKE = "INTAKE"
+    PRICED = "PRICED"
+    PENDING_PAYMENT = "PENDING_PAYMENT"
+    PAID = "PAID"
+    EXECUTING = "EXECUTING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+
+class PaymentStatus(str, Enum):
+    NONE = "NONE"
+    REQUIRED = "REQUIRED"
+    INITIATED = "INITIATED"
+    CONFIRMED = "CONFIRMED"
+    FAILED = "FAILED"
+
+class EventType(str, Enum):
+    PROBLEM_CREATED = "PROBLEM_CREATED"
+    PRICED = "PRICED"
+    PAYMENT_REQUIRED = "PAYMENT_REQUIRED"
+    PAYMENT_INITIATED = "PAYMENT_INITIATED"
+    PAYMENT_CONFIRMED = "PAYMENT_CONFIRMED"
+    PAYMENT_FAILED = "PAYMENT_FAILED"
+    EXECUTION_STARTED = "EXECUTION_STARTED"
+    EXECUTION_COMPLETED = "EXECUTION_COMPLETED"
+    EXECUTION_FAILED = "EXECUTION_FAILED"
+    REVENUE_BOOKED = "REVENUE_BOOKED"
+
+class Problem(BaseModel):
+    id: str
+    type: str
+    payload: dict
+    context: dict = {}
+    status: ProblemStatus = ProblemStatus.INTAKE
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    price: float = 0.0
+    payment_status: PaymentStatus = PaymentStatus.NONE
+    payment_reference: Optional[str] = None
+    flow_name: Optional[str] = None
+    result: Optional[dict] = None
+    error: Optional[str] = None
+
+class OperatorSpec(BaseModel):
+    name: str
+    description: str = ""
+    input_type: str = "generic"
+    output_type: str = "generic"
+
+class FlowStep(BaseModel):
+    operator_name: str
+    description: str = ""
+
+class Flow(BaseModel):
+    name: str
+    problem_type: str
+    base_price: float = 10.0
+    price_per_complexity: float = 1.0
+    steps: List[FlowStep]
+
+class Event(BaseModel):
+    id: str
+    timestamp: datetime
+    type: EventType
+    entity_id: str
+    data: dict = {}
+
+class RevenueEntry(BaseModel):
+    id: str
+    problem_id: str
+    amount: float
+    currency: str = "EUR"
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+class RevenueSummary(BaseModel):
+    total_revenue: float
+    currency: str
+    count: int
+
+# ==============================
+#   In-Memory Stores
+# ==============================
+
+PROBLEMS: Dict[str, Problem] = {}
+FLOWS: Dict[str, Flow] = {}
+OPERATORS: Dict[str, OperatorSpec] = {}
+OPERATOR_IMPL: Dict[str, Callable[[dict], dict]] = {}
+EVENTS: List[Event] = []
+REVENUE: List[RevenueEntry] = []
+
+# ==============================
+#   Events & Revenue
+# ==============================
+
+def emit_event(event_type: EventType, entity_id: str, data: dict = None):
+    ev = Event(
+        id=str(uuid4()),
+        timestamp=datetime.utcnow(),
+        type=event_type,
+        entity_id=entity_id,
+        data=data or {}
+    )
+    EVENTS.append(ev)
+    return ev
+
+def book_revenue(problem_id: str, amount: float, currency: str = "EUR") -> RevenueEntry:
+    entry = RevenueEntry(
+        id=str(uuid4()),
+        problem_id=problem_id,
+        amount=amount,
+        currency=currency
+    )
+    REVENUE.append(entry)
+    emit_event(EventType.REVENUE_BOOKED, problem_id, {"amount": amount, "currency": currency})
+    return entry
+
+def compute_revenue_summary(currency: str = "EUR") -> RevenueSummary:
+    relevant = [r for r in REVENUE if r.currency == currency]
+    total = sum(r.amount for r in relevant)
+    return RevenueSummary(total_revenue=total, currency=currency, count=len(relevant))
+
+# ==============================
+#   Admin: Operators & Flows
+# ==============================
+
+class RegisterOperatorRequest(BaseModel):
+    name: str
+    description: str = ""
+    input_type: str = "generic"
+    output_type: str = "generic"
+    builtin: Optional[str] = None
+
+@app.post("/admin/operators", response_model=OperatorSpec)
+def register_operator(req: RegisterOperatorRequest):
+    if req.name in OPERATORS:
+        raise HTTPException(status_code=400, detail="Operator already exists")
+
+    spec = OperatorSpec(
+        name=req.name,
+        description=req.description,
+        input_type=req.input_type,
+        output_type=req.output_type,
+    )
+    OPERATORS[req.name] = spec
+
+    if req.builtin:
+        if req.builtin == "echo":
+            def impl(payload: dict) -> dict:
+                return {"echo": payload}
+        elif req.builtin == "text_summary":
+            def impl(payload: dict) -> dict:
+                text = payload.get("text", "")
+                words = text.split()
+                return {
+                    "length": len(text),
+                    "word_count": len(words),
+                    "preview": " ".join(words[:30])
+                }
+        elif req.builtin == "numeric_stats":
+            def impl(payload: dict) -> dict:
+                nums = payload.get("numbers", [])
+                if not nums:
+                    return {"count": 0, "sum": 0, "avg": 0}
+                total = sum(nums)
+                return {"count": len(nums), "sum": total, "avg": total / len(nums)}
+        else:
+            raise HTTPException(status_code=400, detail=f"Unknown builtin: {req.builtin}")
+        OPERATOR_IMPL[req.name] = impl
+
+    return spec
+
+@app.get("/admin/operators", response_model=List[OperatorSpec])
+def list_operators():
+    return list(OPERATORS.values())
+
+class CreateFlowRequest(BaseModel):
+    name: str
+    problem_type: str
+    base_price: float = 10.0
+    price_per_complexity: float = 1.0
+    steps: List[FlowStep]
+
+@app.post("/admin/flows", response_model=Flow)
+def create_flow(req: CreateFlowRequest):
+    if req.name in FLOWS:
+        raise HTTPException(status_code=400, detail="Flow already exists")
+
+    flow = Flow(
+        name=req.name,
+        problem_type=req.problem_type,
+        base_price=req.base_price,
+        price_per_complexity=req.price_per_complexity,
+        steps=req.steps
+    )
+    missing = [s.operator_name for s in flow.steps if s.operator_name not in OPERATORS]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"Unknown operators in flow: {missing}")
+
+    FLOWS[flow.name] = flow
+    return flow
+
+@app.get("/admin/flows", response_model=List[Flow])
+def list_flows():
+    return list(FLOWS.values())
+
+# ==============================
+#   Flow Selection & Pricing
+# ==============================
+
+def select_flow_for_problem(problem_type: str) -> Flow:
+    for f in FLOWS.values():
+        if f.problem_type == problem_type:
+            return f
+    raise HTTPException(status_code=400, detail=f"No flow for problem_type={problem_type}")
+
+def compute_price(flow: Flow, payload: dict) -> float:
+    base_complexity = len(str(payload))
+    extra_complexity = payload.get("complexity", 0)
+    complexity = base_complexity + extra_complexity
+    price = flow.base_price + flow.price_per_complexity * complexity
+    return round(price, 2)
+
+# ==============================
+#   Payment Provider Abstraktion
+# ==============================
+
+class PaymentIntent(BaseModel):
+    id: str
+    problem_id: str
+    amount: float
+    currency: str = "EUR"
+    status: PaymentStatus = PaymentStatus.INITIATED
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+
+PAYMENT_INTENTS: Dict[str, PaymentIntent] = {}
+
+class PaymentProvider:
+    """
+    Abstrakte Schicht: kann später durch Stripe, Wallet, On-Chain ersetzt werden.
+    Jetzt: FakeLive, aber strikte Logik, echte State-Änderungen.
+    """
+    def create_intent(self, problem: Problem) -> PaymentIntent:
+        raise NotImplementedError
+
+    def confirm_intent(self, intent_id: str) -> PaymentIntent:
+        raise NotImplementedError
+
+class FakeLivePaymentProvider(PaymentProvider):
+    def create_intent(self, problem: Problem) -> PaymentIntent:
+        pid = str(uuid4())
+        intent = PaymentIntent(
+            id=pid,
+            problem_id=problem.id,
+            amount=problem.price,
+            currency="EUR",
+            status=PaymentStatus.INITIATED
+        )
+        PAYMENT_INTENTS[pid] = intent
+        emit_event(EventType.PAYMENT_INITIATED, problem.id,
+                   {"payment_intent_id": pid, "amount": problem.price})
+        return intent
+
+    def confirm_intent(self, intent_id: str) -> PaymentIntent:
+        intent = PAYMENT_INTENTS.get(intent_id)
+        if not intent:
+            raise HTTPException(status_code=404, detail="PaymentIntent not found")
+        intent.status = PaymentStatus.CONFIRMED
+        return intent
+
+payment_provider: PaymentProvider = FakeLivePaymentProvider()
+
+class CreateProblemRequest(BaseModel):
+    type: str
+    payload: dict
+    context: dict = {}
+
+class CreateProblemResponse(BaseModel):
+    problem: Problem
+    payment_intent: PaymentIntent
+
+@app.post("/problems", response_model=CreateProblemResponse)
+def create_problem(req: CreateProblemRequest):
+    pid = str(uuid4())
+    flow = select_flow_for_problem(req.type)
+    price = compute_price(flow, req.payload)
+
+    problem = Problem(
+        id=pid,
+        type=req.type,
+        payload=req.payload,
+        context=req.context,
+        status=ProblemStatus.PRICED,
+        price=price,
+        payment_status=PaymentStatus.REQUIRED,
+        flow_name=flow.name,
+    )
+    PROBLEMS[pid] = problem
+    emit_event(EventType.PROBLEM_CREATED, pid, {"type": req.type})
+    emit_event(EventType.PRICED, pid, {"price": price})
+    emit_event(EventType.PAYMENT_REQUIRED, pid, {"price": price})
+
+    intent = payment_provider.create_intent(problem)
+    problem.payment_status = PaymentStatus.INITIATED
+    problem.payment_reference = intent.id
+    problem.updated_at = datetime.utcnow()
+
+    return CreateProblemResponse(problem=problem, payment_intent=intent)
+
+@app.get("/problems/{problem_id}", response_model=Problem)
+def get_problem(problem_id: str):
+    problem = PROBLEMS.get(problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail="Problem not found")
+    return problem
+
+class ConfirmPaymentRequest(BaseModel):
+    intent_id: str
+
+@app.post("/payments/confirm", response_model=Problem)
+def confirm_payment(req: ConfirmPaymentRequest):
+    intent = payment_provider.confirm_intent(req.intent_id)
+    problem = PROBLEMS.get(intent.problem_id)
+    if not problem:
+        raise HTTPException(status_code=404, detail="Problem not found for payment")
+
+    if problem.payment_status not in [PaymentStatus.REQUIRED, PaymentStatus.INITIATED]:
+        raise HTTPException(status_code=400, detail=f"Invalid payment state: {problem.payment_status}")
+
+    intent.status = PaymentStatus.CONFIRMED
+    problem.payment_status = PaymentStatus.CONFIRMED
+    problem.status = ProblemStatus.PAID
+    problem.updated_at = datetime.utcnow()
+    emit_event(EventType.PAYMENT_CONFIRMED, problem.id,
+               {"amount": problem.price, "payment_intent_id": intent.id})
+
+    execute_problem(problem)
+    return problem
+
+# ==============================
+#   Execution Engine
+# ==============================
+
+def execute_problem(problem: Problem):
+    if problem.payment_status != PaymentStatus.CONFIRMED:
+        raise HTTPException(status_code=400, detail="Cannot execute unpaid problem")
+
+    flow = FLOWS.get(problem.flow_name or "")
+    if not flow:
+        raise HTTPException

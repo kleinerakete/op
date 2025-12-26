@@ -1,0 +1,1020 @@
+```python
+"""
+OperatorTheta RuleCore Engine – Vollständiges Python-System (Problem + Regeln + Work + Einnahmen + Dashboard)
+
+ZIEL
+- Vollständige, EIN-FILE Python-Anwendung:
+  - Regelbasierte Engine (Problems -> WorkJobs -> Revenue)
+  - Formellogik (Priorität, Komplexität, Einnahmen-Scores)
+  - FastAPI-API + einfaches HTML-Dashboard für Einnahmen & Jobs
+  - Live-Events per SSE
+
+ANLEITUNG (COPY-PASTE READY)
+
+1. Neue Umgebung (optional, aber empfohlen):
+
+    python -m venv venv
+    source venv/bin/activate          # Windows: venv\\Scripts\\activate
+
+2. Benötigte Pakete installieren:
+
+    pip install fastapi uvicorn[standard] jinja2
+
+3. Diese Datei speichern als:
+
+    theta_rulecore.py
+
+4. Server starten:
+
+    python theta_rulecore.py
+
+5. Öffnen im Browser:
+
+    - Dashboard:         http://127.0.0.1:8000/dashboard
+    - API-Dokumentation: http://127.0.0.1:8000/docs
+    - Basis-API-URL:     http://127.0.0.1:8000
+
+6. Beispiel Problem-Intake (z.B. mit curl oder in /docs):
+
+    POST /problems
+    Body JSON:
+    {
+      "title": "Skalierungsproblem in verteiltem Cluster",
+      "description": "Cluster hängt ab 10k RPS, Fehlerpeak bei Node-Failover.",
+      "severity": "critical",
+      "tags": ["infra", "distributed", "scaling", "nonlinear"]
+    }
+
+DIE REGELN
+- Kein Job ohne Problem
+- Kein Job ohne zugehörige „Workline“ (Regel: welche Arbeit wird gemacht)
+- Kein Revenue ohne abgeschlossenen Job
+- Einkommen wird pro Job nach formelbasierter Logik berechnet (Difficulty * Value-Faktor)
+"""
+
+from __future__ import annotations
+
+import asyncio
+import math
+import time
+import uuid
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+from typing import List, Dict, Optional, Any
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
+from pydantic import BaseModel, Field
+
+
+# =============================================================================
+# ENUMS / STATI
+# =============================================================================
+
+class Severity(str, Enum):
+    moderate = "moderate"
+    high = "high"
+    critical = "critical"
+
+
+class ProblemStatus(str, Enum):
+    open = "open"
+    analyzing = "analyzing"
+    solved = "solved"
+    failed = "failed"
+
+
+class JobStatus(str, Enum):
+    queued = "queued"
+    running = "running"
+    completed = "completed"
+    failed = "failed"
+
+
+# =============================================================================
+# DOMAIN-MODELLE
+# =============================================================================
+
+@dataclass
+class Problem:
+    id: str
+    title: str
+    description: str
+    severity: Severity
+    tags: List[str]
+    created_at: float
+    updated_at: float
+    status: ProblemStatus = ProblemStatus.open
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class WorkLine:
+    """
+    Repräsentiert eine „Linie“ von bezahlter Arbeit, regelbasiert.
+    Z.B.:
+        - "ScienceLab Deep Analysis"
+        - "System Architecture Fix"
+        - "API Monetization Blueprint"
+    """
+    id: str
+    name: str
+    description: str
+    base_value_eur: float
+    complexity_factor: float
+    allowed_tags: List[str]        # Tags, für die diese Linie primär zuständig ist
+    created_at: float
+    active: bool = True
+
+
+@dataclass
+class WorkJob:
+    id: str
+    problem_id: str
+    workline_id: str
+    created_at: float
+    updated_at: float
+    status: JobStatus
+    priority: float
+    complexity_score: float
+    difficulty_index: float
+    solution_confidence: float
+    revenue_estimate_eur: float
+    phases: List[str]
+    logs: List[str] = field(default_factory=list)
+    result_summary: Optional[str] = None
+    result_data: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class SolutionArtifact:
+    id: str
+    problem_id: str
+    job_id: str
+    kind: str         # z.B. "spec_outline", "experiment_plan"
+    created_at: float
+    payload: Dict[str, Any]
+
+
+@dataclass
+class EngineMetric:
+    timestamp: float
+    total_problems: int
+    total_jobs: int
+    solved_problems: int
+    failed_problems: int
+    completed_jobs: int
+    failed_jobs: int
+    total_revenue_estimate: float
+
+
+# =============================================================================
+# API-SCHEMAS (Pydantic)
+# =============================================================================
+
+class ProblemCreate(BaseModel):
+    title: str
+    description: str
+    severity: Severity = Severity.critical
+    tags: List[str] = Field(default_factory=list)
+    meta: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ProblemView(BaseModel):
+    id: str
+    title: str
+    description: str
+    severity: Severity
+    tags: List[str]
+    created_at: float
+    updated_at: float
+    status: ProblemStatus
+    meta: Dict[str, Any]
+
+
+class WorkLineView(BaseModel):
+    id: str
+    name: str
+    description: str
+    base_value_eur: float
+    complexity_factor: float
+    allowed_tags: List[str]
+    created_at: float
+    active: bool
+
+
+class JobView(BaseModel):
+    id: str
+    problem_id: str
+    workline_id: str
+    created_at: float
+    updated_at: float
+    status: JobStatus
+    priority: float
+    complexity_score: float
+    difficulty_index: float
+    solution_confidence: float
+    revenue_estimate_eur: float
+    phases: List[str]
+    logs: List[str]
+    result_summary: Optional[str]
+    result_data: Dict[str, Any]
+
+
+class SolutionArtifactView(BaseModel):
+    id: str
+    problem_id: str
+    job_id: str
+    kind: str
+    created_at: float
+    payload: Dict[str, Any]
+
+
+class EngineMetricView(BaseModel):
+    timestamp: float
+    total_problems: int
+    total_jobs: int
+    solved_problems: int
+    failed_problems: int
+    completed_jobs: int
+    failed_jobs: int
+    total_revenue_estimate: float
+
+
+# =============================================================================
+# IN-MEMORY-STORE
+# =============================================================================
+
+class RuleCoreStore:
+    def __init__(self) -> None:
+        self.problems: Dict[str, Problem] = {}
+        self.worklines: Dict[str, WorkLine] = {}
+        self.jobs: Dict[str, WorkJob] = {}
+        self.artifacts: Dict[str, SolutionArtifact] = {}
+        self.metrics: List[EngineMetric] = []
+        self._lock = asyncio.Lock()
+
+    # Problems
+    async def add_problem(self, p: Problem) -> None:
+        async with self._lock:
+            self.problems[p.id] = p
+
+    async def update_problem(self, p: Problem) -> None:
+        async with self._lock:
+            self.problems[p.id] = p
+
+    async def get_problem(self, pid: str) -> Optional[Problem]:
+        async with self._lock:
+            return self.problems.get(pid)
+
+    async def list_problems(self) -> List[Problem]:
+        async with self._lock:
+            return list(self.problems.values())
+
+    # WorkLines
+    async def add_workline(self, w: WorkLine) -> None:
+        async with self._lock:
+            self.worklines[w.id] = w
+
+    async def list_worklines(self) -> List[WorkLine]:
+        async with self._lock:
+            return list(self.worklines.values())
+
+    async def get_workline(self, wid: str) -> Optional[WorkLine]:
+        async with self._lock:
+            return self.worklines.get(wid)
+
+    # Jobs
+    async def add_job(self, j: WorkJob) -> None:
+        async with self._lock:
+            self.jobs[j.id] = j
+
+    async def update_job(self, j: WorkJob) -> None:
+        async with self._lock:
+            self.jobs[j.id] = j
+
+    async def get_job(self, jid: str) -> Optional[WorkJob]:
+        async with self._lock:
+            return self.jobs.get(jid)
+
+    async def list_jobs(self, problem_id: Optional[str] = None) -> List[WorkJob]:
+        async with self._lock:
+            if problem_id:
+                return [j for j in self.jobs.values() if j.problem_id == problem_id]
+            return list(self.jobs.values())
+
+    # Artefakte
+    async def add_artifact(self, a: SolutionArtifact) -> None:
+        async with self._lock:
+            self.artifacts[a.id] = a
+
+    async def list_artifacts_for_problem(self, pid: str) -> List[SolutionArtifact]:
+        async with self._lock:
+            return [a for a in self.artifacts.values() if a.problem_id == pid]
+
+    # Metrics
+    async def snapshot_metrics(self) -> EngineMetric:
+        async with self._lock:
+            total_problems = len(self.problems)
+            total_jobs = len(self.jobs)
+            solved_problems = len([p for p in self.problems.values() if p.status == ProblemStatus.solved])
+            failed_problems = len([p for p in self.problems.values() if p.status == ProblemStatus.failed])
+            completed_jobs = len([j for j in self.jobs.values() if j.status == JobStatus.completed])
+            failed_jobs = len([j for j in self.jobs.values() if j.status == JobStatus.failed])
+            total_revenue_estimate = sum(j.revenue_estimate_eur for j in self.jobs.values())
+
+        metric = EngineMetric(
+            timestamp=time.time(),
+            total_problems=total_problems,
+            total_jobs=total_jobs,
+            solved_problems=solved_problems,
+            failed_problems=failed_problems,
+            completed_jobs=completed_jobs,
+            failed_jobs=failed_jobs,
+            total_revenue_estimate=round(total_revenue_estimate, 2),
+        )
+        async with self._lock:
+            self.metrics.append(metric)
+        return metric
+
+
+store = RuleCoreStore()
+
+
+# =============================================================================
+# EVENT-BUS (SSE)
+# =============================================================================
+
+class EventBus:
+    def __init__(self) -> None:
+        self.subscribers: List[asyncio.Queue] = []
+
+    async def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self.subscribers.append(q)
+        return q
+
+    async def unsubscribe(self, q: asyncio.Queue) -> None:
+        if q in self.subscribers:
+            self.subscribers.remove(q)
+
+    async def publish(self, event_type: str, payload: Dict[str, Any]) -> None:
+        event = {
+            "type": event_type,
+            "timestamp": time.time(),
+            "payload": payload,
+        }
+        for q in self.subscribers:
+            await q.put(event)
+
+
+bus = EventBus()
+
+
+# =============================================================================
+# REGEL- / FORMEL-LOGIK
+# =============================================================================
+
+def severity_weight(severity: Severity) -> float:
+    return {
+        Severity.critical: 1.0,
+        Severity.high: 0.7,
+        Severity.moderate: 0.4,
+    }[severity]
+
+
+def tag_complexity(tags: List[str]) -> float:
+    base = len(tags)
+    bonus = 0.0
+    special = {"distributed", "nonlinear", "stochastic", "quantum", "np-hard", "chaos"}
+    for t in tags:
+        tl = t.lower()
+        if tl in special:
+            bonus += 2.0
+        elif len(tl) > 10:
+            bonus += 0.5
+    return base + bonus
+
+
+def compute_priority(severity: Severity, complexity: float) -> float:
+    w = severity_weight(severity)
+    return 100.0 * w * (1.0 + math.log(1.0 + complexity))
+
+
+def estimate_solution_confidence(severity: Severity, complexity: float) -> float:
+    w = severity_weight(severity)
+    base_conf = 0.8 - 0.1 * w
+    damping = 1.0 / (1.0 + 0.3 * complexity)
+    conf = base_conf * damping
+    return max(0.05, min(0.95, conf))
+
+
+def difficulty_index(severity: Severity, complexity: float) -> float:
+    return severity_weight(severity) * (1.0 + math.log(1.0 + complexity))
+
+
+def estimate_revenue(workline: WorkLine, difficulty: float) -> float:
+    """
+    Formel für die Einnahme-Schätzung:
+        revenue = base_value * (1 + complexity_factor * difficulty)
+    """
+    factor = 1.0 + workline.complexity_factor * difficulty
+    return round(workline.base_value_eur * factor, 2)
+
+
+def extract_phases(problem: Problem, workline: WorkLine) -> List[str]:
+    phases = [
+        "normalize_problem",
+        "extract_constraints",
+        "map_to_workline",
+        "design_solution_path",
+        "prepare_science_artifacts",
+    ]
+    lower_tags = [t.lower() for t in problem.tags]
+
+    if any(x in lower_tags for x in ["infra", "scaling", "distributed"]):
+        phases.append("capacity_and_bottleneck_analysis")
+    if any(x in lower_tags for x in ["ai", "ml", "nn"]):
+        phases.append("model_and_data_analysis")
+    if any(x in lower_tags for x in ["quantum", "math", "physics"]):
+        phases.append("formal_modeling")
+
+    phases.append(f"workline_specific: {workline.name}")
+    return phases
+
+
+def select_workline(problem: Problem, worklines: List[WorkLine]) -> Optional[WorkLine]:
+    """
+    Regelbasierte Auswahl der passenden WorkLine:
+    - Score nach Tag-Overlap + Base-Value + Severity
+    """
+    best: Optional[WorkLine] = None
+    best_score = -1.0
+    problem_tags = {t.lower() for t in problem.tags}
+
+    for w in worklines:
+        if not w.active:
+            continue
+        overlap = problem_tags.intersection({t.lower() for t in w.allowed_tags})
+        overlap_score = len(overlap) * 10.0
+        sev_bonus = severity_weight(problem.severity) * 5.0
+        value_score = math.log(1.0 + w.base_value_eur)
+        score = overlap_score + sev_bonus + value_score
+
+        if score > best_score:
+            best_score = score
+            best = w
+
+    return best
+
+
+def synthesize_result(problem: Problem, job: WorkJob, workline: WorkLine) -> tuple[str, Dict[str, Any]]:
+    summary_lines = [
+        f"Problem: {problem.title}",
+        f"Severity: {problem.severity.value}",
+        f"Tags: {', '.join(problem.tags) if problem.tags else '-'}",
+        f"WorkLine: {workline.name}",
+        "",
+        "Eingesetzte Formel-Metriken:",
+        f"  - Komplexität: {job.complexity_score:.3f}",
+        f"  - Schwierigkeitsindex: {job.difficulty_index:.3f}",
+        f"  - Anfangs-Confidence: {job.solution_confidence:.3f}",
+        f"  - Revenue-Schätzung (EUR): {job.revenue_estimate_eur:.2f}",
+        "",
+        "Phasenlauf:",
+    ]
+    summary_lines.extend([f"  - {p}" for p in job.phases])
+    summary_lines += [
+        "",
+        "Interpretation:",
+        "  Diese Meta-Sicht kann direkt in ein Science-/Tech-Labor übersetzt werden.",
+        "  An dieser Stelle kannst du echte Rechenmodelle, Simulationen, Optimierer etc. anbinden.",
+    ]
+    summary = "\n".join(summary_lines)
+
+    data = {
+        "problem_id": problem.id,
+        "job_id": job.id,
+        "workline_id": workline.id,
+        "complexity_score": job.complexity_score,
+        "difficulty_index": job.difficulty_index,
+        "solution_confidence": job.solution_confidence,
+        "revenue_estimate_eur": job.revenue_estimate_eur,
+        "phases": job.phases,
+        "meta_hint": "Hier echte Lösung / Artefakte / Rechenergebnisse einhängen.",
+    }
+    return summary, data
+
+
+def build_artifacts(problem: Problem, job: WorkJob, workline: WorkLine) -> List[SolutionArtifact]:
+    now = time.time()
+    artifacts: List[SolutionArtifact] = []
+
+    spec_payload = {
+        "title": f"{workline.name} – Spec für: {problem.title}",
+        "sections": [
+            "1. Problem Statement",
+            "2. Kontext & Rahmenbedingungen",
+            "3. Formale Modellierung / Architektur",
+            "4. Experiment/Simulation-Setup",
+            "5. Auswertung & Erfolgskriterien",
+        ],
+        "tags": problem.tags,
+        "workline": workline.name,
+    }
+    artifacts.append(
+        SolutionArtifact(
+            id=str(uuid.uuid4()),
+            problem_id=problem.id,
+            job_id=job.id,
+            kind="spec_outline",
+            created_at=now,
+            payload=spec_payload,
+        )
+    )
+
+    experiment_payload = {
+        "notebook_hint": f"notebooks/{problem.id}_{workline.id}.ipynb",
+        "steps": [
+            "Daten/Parameter definieren",
+            "Modelle/Gleichungen implementieren",
+            "Parameter-Sweeps / Szenarien laufen lassen",
+            "Metriken sammeln",
+            "Ergebnisse interpretieren",
+        ],
+    }
+    artifacts.append(
+        SolutionArtifact(
+            id=str(uuid.uuid4()),
+            problem_id=problem.id,
+            job_id=job.id,
+            kind="experiment_plan",
+            created_at=now,
+            payload=experiment_payload,
+        )
+    )
+
+    return artifacts
+
+
+# =============================================================================
+# WORKER LOOP
+# =============================================================================
+
+async def worker_loop():
+    """
+    Kern:
+    - offene Probleme -> WorkLine auswählen -> Job erzeugen
+    - Job durchlaufen -> Ergebnisse + Artefakte + Revenue-Schätzung
+    """
+    while True:
+        await asyncio.sleep(0.5)
+
+        problems = await store.list_problems()
+        worklines = await store.list_worklines()
+
+        open_problems = [p for p in problems if p.status in (ProblemStatus.open, ProblemStatus.analyzing)]
+
+        for p in open_problems:
+            jobs = await store.list_jobs(problem_id=p.id)
+            unfinished = [j for j in jobs if j.status in (JobStatus.queued, JobStatus.running)]
+
+            # Falls kein Job existiert: neuen erstellen
+            if not unfinished:
+                wl = select_workline(p, worklines)
+                if wl is None:
+                    # keine passende WorkLine -> Problem bleibt open
+                    continue
+
+                comp = tag_complexity(p.tags)
+                prio = compute_priority(p.severity, comp)
+                diff = difficulty_index(p.severity, comp)
+                conf = estimate_solution_confidence(p.severity, comp)
+                rev = estimate_revenue(wl, diff)
+                phases = extract_phases(p, wl)
+
+                now = time.time()
+                job = WorkJob(
+                    id=str(uuid.uuid4()),
+                    problem_id=p.id,
+                    workline_id=wl.id,
+                    created_at=now,
+                    updated_at=now,
+                    status=JobStatus.queued,
+                    priority=prio,
+                    complexity_score=comp,
+                    difficulty_index=diff,
+                    solution_confidence=conf,
+                    revenue_estimate_eur=rev,
+                    phases=phases,
+                    logs=[f"Job created (prio={prio:.2f}, diff={diff:.2f}, rev={rev:.2f})"],
+                )
+                await store.add_job(job)
+
+                p.status = ProblemStatus.analyzing
+                p.updated_at = time.time()
+                await store.update_problem(p)
+
+                await bus.publish("job_created", {"job_id": job.id, "problem_id": p.id})
+
+            # bestehende Jobs voran treiben
+            jobs = await store.list_jobs(problem_id=p.id)
+            for j in jobs:
+                wl = await store.get_workline(j.workline_id)
+                if wl is None:
+                    continue
+
+                if j.status == JobStatus.queued:
+                    j.status = JobStatus.running
+                    j.logs.append("Job started: running rule/formula pipeline.")
+                    j.updated_at = time.time()
+                    await store.update_job(j)
+                    await bus.publish("job_started", {"job_id": j.id, "problem_id": p.id})
+
+                elif j.status == JobStatus.running:
+                    # einfache Zeitbedingung: nach 2 Sekunden fertig
+                    if time.time() - j.created_at > 2.0:
+                        problem = await store.get_problem(j.problem_id)
+                        if not problem:
+                            continue
+
+                        summary, data = synthesize_result(problem, j, wl)
+                        j.status = JobStatus.completed
+                        j.result_summary = summary
+                        j.result_data = data
+                        j.logs.append("Job completed: solution + revenue estimate generated.")
+                        j.updated_at = time.time()
+                        await store.update_job(j)
+
+                        problem.status = ProblemStatus.solved
+                        problem.updated_at = time.time()
+                        await store.update_problem(problem)
+
+                        artifacts = build_artifacts(problem, j, wl)
+                        for a in artifacts:
+                            await store.add_artifact(a)
+
+                        await bus.publish(
+                            "job_completed",
+                            {
+                                "job_id": j.id,
+                                "problem_id": problem.id,
+                                "revenue_estimate_eur": j.revenue_estimate_eur,
+                            },
+                        )
+
+        metric = await store.snapshot_metrics()
+        await bus.publish("metric_snapshot", asdict(metric))
+
+
+# =============================================================================
+# FASTAPI + DASHBOARD
+# =============================================================================
+
+app = FastAPI(
+    title="OperatorTheta RuleCore Engine",
+    description="Regelbasierter Meta-Kern für Problems -> Work -> Revenue.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+templates = Jinja2Templates(directory=".")
+
+
+@app.on_event("startup")
+async def on_startup():
+    # WorkLines bootstrappen
+    now = time.time()
+    wl1 = WorkLine(
+        id=str(uuid.uuid4()),
+        name="ScienceLab Deep Analysis",
+        description="Tiefe wissenschaftlich-technische Analyse mit Experiment-Planung.",
+        base_value_eur=800.0,
+        complexity_factor=0.8,
+        allowed_tags=["science", "physics", "math", "nonlinear", "quantum"],
+        created_at=now,
+    )
+    wl2 = WorkLine(
+        id=str(uuid.uuid4()),
+        name="System Architecture Fix",
+        description="Gezielte Architektur- und Skalierungs-Fixes.",
+        base_value_eur=1200.0,
+        complexity_factor=0.6,
+        allowed_tags=["infra", "scaling", "distributed", "architecture"],
+        created_at=now,
+    )
+    wl3 = WorkLine(
+        id=str(uuid.uuid4()),
+        name="AI/ML Model Strategy",
+        description="Meta-Strategie und Systematik für ML-/Modell-Setups.",
+        base_value_eur=1500.0,
+        complexity_factor=0.9,
+        allowed_tags=["ai", "ml", "nn", "model"],
+        created_at=now,
+    )
+    await store.add_workline(wl1)
+    await store.add_workline(wl2)
+    await store.add_workline(wl3)
+
+    # Worker starten
+    asyncio.create_task(worker_loop())
+
+
+@app.get("/")
+async def root():
+    return {"name": "OperatorTheta RuleCore Engine", "status": "ok", "docs": "/docs"}
+
+
+# ---- Dashboard (HTML) -------------------------------------------------------
+
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8" />
+  <title>OperatorTheta RuleCore Dashboard</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 20px; background: #0b1020; color: #f2f4ff; }
+    h1, h2 { color: #f0f4ff; }
+    .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+    .card { background: #141a33; padding: 12px 16px; border-radius: 8px; min-width: 200px; }
+    .label { font-size: 12px; color: #a3accf; text-transform: uppercase; letter-spacing: 0.06em; }
+    .value { font-size: 20px; font-weight: 600; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { padding: 8px 6px; border-bottom: 1px solid #262c44; font-size: 13px; }
+    th { text-align: left; color: #a3accf; }
+    tr:hover { background: #171f3a; }
+    .tag { display: inline-block; padding: 2px 6px; border-radius: 4px; background: #202746; margin-right: 4px; font-size: 11px; }
+    .status { font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+    .status-open { background: #3b3f6a; }
+    .status-analyzing { background: #845ef7; }
+    .status-solved { background: #2f9e44; }
+    .status-failed { background: #c92a2a; }
+    .status-job-queued { background: #3b3f6a; }
+    .status-job-running { background: #e67700; }
+    .status-job-completed { background: #2f9e44; }
+    .status-job-failed { background: #c92a2a; }
+    small { color: #8d95c2; }
+    .layout { display: grid; grid-template-columns: 1.2fr 1fr; gap: 20px; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <h1>OperatorTheta RuleCore Engine</h1>
+  <p><small>Echtzeit-Übersicht: Probleme, WorkJobs und Einnahmen-Schätzung (nur Engine-Logik, keine echte Payment-Anbindung).</small></p>
+
+  <div class="cards" id="metrics-cards">
+    <div class="card">
+      <div class="label">Total Revenue (estimate)</div>
+      <div class="value" id="metric-revenue">-</div>
+    </div>
+    <div class="card">
+      <div class="label">Problems</div>
+      <div class="value" id="metric-problems">-</div>
+    </div>
+    <div class="card">
+      <div class="label">Jobs</div>
+      <div class="value" id="metric-jobs">-</div>
+    </div>
+    <div class="card">
+      <div class="label">Completed Jobs</div>
+      <div class="value" id="metric-completed">-</div>
+    </div>
+  </div>
+
+  <div class="layout">
+    <div>
+      <h2>Aktive / kürzliche Probleme</h2>
+      <table id="problems-table">
+        <thead>
+          <tr>
+            <th>Title</th>
+            <th>Severity</th>
+            <th>Status</th>
+            <th>Tags</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div>
+      <h2>WorkJobs (kürzlich)</h2>
+      <table id="jobs-table">
+        <thead>
+          <tr>
+            <th>Job</th>
+            <th>Problem</th>
+            <th>Status</th>
+            <th>Revenue est.</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    async function fetchJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      return await res.json();
+    }
+
+    function statusClassForProblem(status) {
+      if (status === "open") return "status status-open";
+      if (status === "analyzing") return "status status-analyzing";
+      if (status === "solved") return "status status-solved";
+      if (status === "failed") return "status status-failed";
+      return "status";
+    }
+
+    function statusClassForJob(status) {
+      if (status === "queued") return "status status-job-queued";
+      if (status === "running") return "status status-job-running";
+      if (status === "completed") return "status status-job-completed";
+      if (status === "failed") return "status status-job-failed";
+      return "status";
+    }
+
+    async function refreshData() {
+      try {
+        const [metrics, problems, jobs] = await Promise.all([
+          fetchJSON("/metrics"),
+          fetchJSON("/problems"),
+          fetchJSON("/jobs"),
+        ]);
+
+        document.getElementById("metric-revenue").textContent =
+          metrics.total_revenue_estimate.toFixed(2) + " EUR";
+        document.getElementById("metric-problems").textContent =
+          metrics.total_problems;
+        document.getElementById("metric-jobs").textContent =
+          metrics.total_jobs;
+        document.getElementById("metric-completed").textContent =
+          metrics.completed_jobs;
+
+        const pBody = document.querySelector("#problems-table tbody");
+        pBody.innerHTML = "";
+        problems.slice(-15).reverse().forEach(p => {
+          const tr = document.createElement("tr");
+          const tagsHtml = (p.tags || []).map(t => `<span class="tag">${t}</span>`).join(" ");
+          tr.innerHTML = `
+            <td>${p.title}</td>
+            <td>${p.severity}</td>
+            <td><span class="${statusClassForProblem(p.status)}">${p.status}</span></td>
+            <td>${tagsHtml}</td>
+          `;
+          pBody.appendChild(tr);
+        });
+
+        const jBody = document.querySelector("#jobs-table tbody");
+        jBody.innerHTML = "";
+        jobs.slice(-15).reverse().forEach(j => {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${j.id.slice(0, 6)}...</td>
+            <td>${j.problem_id.slice(0, 6)}...</td>
+            <td><span class="${statusClassForJob(j.status)}">${j.status}</span></td>
+            <td>${j.revenue_estimate_eur.toFixed(2)} EUR</td>
+          `;
+          jBody.appendChild(tr);
+        });
+
+      } catch (e) {
+        console.error("Refresh error:", e);
+      }
+    }
+
+    // Initial load
+    refreshData();
+    // Poll alle 3s als Fallback
+    setInterval(refreshData, 3000);
+
+    // SSE-Stream für Live-Updates (optional)
+    try {
+      const source = new EventSource("/events/stream");
+      source.onmessage = (event) => {
+        // Jede Nachricht triggert einfach ein Refresh
+        refreshData();
+      };
+    } catch (e) {
+      console.warn("SSE nicht verfügbar:", e);
+    }
+  </script>
+</body>
+</html>
+"""
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
+async def dashboard():
+    return HTMLResponse(content=DASHBOARD_HTML)
+
+
+# ---- API: Problems, WorkLines, Jobs, Artifacts, Metrics ---------------------
+
+@app.post("/problems", response_model=ProblemView)
+async def create_problem(req: ProblemCreate):
+    now = time.time()
+    p = Problem(
+        id=str(uuid.uuid4()),
+        title=req.title,
+        description=req.description,
+        severity=req.severity,
+        tags=req.tags,
+        created_at=now,
+        updated_at=now,
+        status=ProblemStatus.open,
+        meta=req.meta,
+    )
+    await store.add_problem(p)
+    await bus.publish("problem_created", {"problem_id": p.id})
+    return ProblemView(**asdict(p))
+
+
+@app.get("/problems", response_model=List[ProblemView])
+async def list_problems():
+    problems = await store.list_problems()
+    return [ProblemView(**asdict(p)) for p in problems]
+
+
+@app.get("/problems/{problem_id}", response_model=ProblemView)
+async def get_problem(problem_id: str):
+    p = await store.get_problem(problem_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="Problem not found")
+    return ProblemView(**asdict(p))
+
+
+@app.get("/worklines", response_model=List[WorkLineView])
+async def list_worklines():
+    wls = await store.list_worklines()
+    return [WorkLineView(**asdict(w)) for w in wls]
+
+
+@app.get("/jobs", response_model=List[JobView])
+async def list_jobs(problem_id: Optional[str] = None):
+    jobs = await store.list_jobs(problem_id=problem_id)
+    return [JobView(**asdict(j)) for j in jobs]
+
+
+@app.get("/jobs/{job_id}", response_model=JobView)
+async def get_job(job_id: str):
+    j = await store.get_job(job_id)
+    if not j:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return JobView(**asdict(j))
+
+
+@app.get("/artifacts/{problem_id}", response_model=List[SolutionArtifactView])
+async def list_artifacts(problem_id: str):
+    arts = await store.list_artifacts_for_problem(problem_id)
+    return [SolutionArtifactView(**asdict(a)) for a in arts]
+
+
+@app.get("/metrics", response_model=EngineMetricView)
+async def get_metrics():
+    metric = await store.snapshot_metrics()
+    return EngineMetricView(**asdict(metric))
+
+
+@app.get("/events/stream")
+async def events_stream():
+    async def event_generator():
+        q = await bus.subscribe()
+        try:
+            while True:
+                event = await q.get()
+                yield f"data: {event}\n\n"
+        finally:
+            await bus.unsubscribe(q)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "theta_rulecore:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+    )
+```
