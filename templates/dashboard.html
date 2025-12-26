@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Dashboard - ThetaOperator</title>
+    <style>
+        body { font-family: sans-serif; max-width: 1000px; margin: auto; padding: 20px; }
+        .header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #ccc; padding-bottom: 10px; }
+        .section { margin-top: 20px; border: 1px solid #eee; padding: 15px; border-radius: 5px; }
+        .btn { padding: 8px 15px; cursor: pointer; border: none; border-radius: 4px; background: #28a745; color: white; }
+        .btn-secondary { background: #6c757d; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Dashboard</h1>
+        <div>
+            <span>Welcome, {{ user.email }}</span>
+            <a href="{{ url_for('replit_auth.logout') }}">Logout</a>
+        </div>
+    </div>
+
+    <div class="section">
+        <h2>Submit AI Task</h2>
+        <input type="text" id="taskInput" placeholder="Enter task description..." style="width: 70%; padding: 8px;">
+        <button class="btn" onclick="submitTask()">Submit & Price</button>
+    </div>
+
+    <div id="pricingSection" class="section" style="display:none;">
+        <h3>Task Priced</h3>
+        <p>Problem ID: <span id="probId"></span></p>
+        <p>Estimated Cost: <span id="probPrice"></span> EUR</p>
+        <button class="btn" onclick="confirmPayment()">Confirm Payment & Execute</button>
+    </div>
+
+    <div id="statusSection" class="section" style="display:none;">
+        <h3>Status</h3>
+        <p id="executionStatus"></p>
+    </div>
+
+    <div class="section">
+        <h2>Revenue Summary</h2>
+        <p>Total Revenue: <span id="totalRevenue">Loading...</span> EUR</p>
+        <button class="btn btn-secondary" onclick="updateRevenue()">Refresh</button>
+    </div>
+
+    <script>
+        async function submitTask() {
+            const text = document.getElementById('taskInput').value;
+            const res = await fetch('/problems', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({type: 'ai_task', payload: {text: text}})
+            });
+            const data = await res.json();
+            if (data.problem_id) {
+                document.getElementById('probId').innerText = data.problem_id;
+                document.getElementById('probPrice').innerText = data.price;
+                document.getElementById('pricingSection').style.display = 'block';
+            }
+        }
+
+        async function confirmPayment() {
+            const probId = document.getElementById('probId').innerText;
+            const res = await fetch('/payments/confirm', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({problem_id: probId})
+            });
+            const data = await res.json();
+            document.getElementById('statusSection').style.display = 'block';
+            document.getElementById('executionStatus').innerText = data.status;
+            updateRevenue();
+        }
+
+        async function updateRevenue() {
+            const res = await fetch('/revenue/summary');
+            const data = await res.json();
+            document.getElementById('totalRevenue').innerText = data.total_revenue;
+        }
+
+        // Bootstrap on load
+        fetch('/admin/bootstrap', {method: 'POST'});
+        updateRevenue();
+    </script>
+</body>
+</html>
