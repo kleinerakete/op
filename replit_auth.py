@@ -28,12 +28,12 @@ def load_user(user_id):
 class UserSessionStorage(BaseStorage):
     def get(self, blueprint) -> str | None:
         try:
-            token = db.session.query(OAuth).filter_by(
+            oauth_record = db.session.query(OAuth).filter_by(
                 user_id=current_user.get_id(),
                 browser_session_key=g.browser_session_key,
                 provider=blueprint.name,
-            ).one().token
-            return token
+            ).one()
+            return str(oauth_record.token) if oauth_record.token else None
         except NoResultFound:
             return None
 
