@@ -26,16 +26,16 @@ def create_problem_route():
         flow = select_flow_for_problem(data['type'])
         price = compute_price(flow, data['payload'])
         
-        problem = Problem(
-            id=str(uuid.uuid4()),
-            user_id=current_user.id,
-            type=data['type'],
-            payload=data['payload'],
-            status='PRICED',
-            price=price,
-            payment_status='REQUIRED',
-            flow_name=flow.name
-        )
+        problem = Problem()
+        problem.id = str(uuid.uuid4())
+        problem.user_id = current_user.id
+        problem.type = data['type']
+        problem.payload = data['payload']
+        problem.status = 'PRICED'
+        problem.price = price
+        problem.payment_status = 'REQUIRED'
+        problem.flow_name = flow.name
+        
         db.session.add(problem)
         db.session.commit()
         return jsonify({"problem_id": problem.id, "price": price})
@@ -62,15 +62,18 @@ def confirm_payment_route():
 def bootstrap():
     # Only for initial setup, normally protected
     if Operator.query.count() == 0:
-        op = Operator(name="AI_Analyzer", description="Analyzes complex data using GPT-5")
+        op = Operator()
+        op.name = "AI_Analyzer"
+        op.description = "Analyzes complex data using GPT-5"
         db.session.add(op)
-        flow = Flow(
-            name="General_AI_Flow",
-            problem_type="ai_task",
-            base_price=5.0,
-            price_per_complexity=0.1,
-            steps=[{"operator_name": "AI_Analyzer"}]
-        )
+        
+        flow = Flow()
+        flow.name = "General_AI_Flow"
+        flow.problem_type = "ai_task"
+        flow.base_price = 5.0
+        flow.price_per_complexity = 0.1
+        flow.steps = [{"operator_name": "AI_Analyzer"}]
+        
         db.session.add(flow)
         db.session.commit()
     return jsonify({"status": "Bootstrapped"})
