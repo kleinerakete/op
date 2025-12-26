@@ -373,6 +373,7 @@ def execute_problem(problem: Problem):
     if problem.payment_status != PaymentStatus.CONFIRMED:
         raise HTTPException(status_code=400, detail="Cannot execute unpaid problem")
 
+
     flow = FLOWS.get(problem.flow_name or "")
     if not flow:
         raise HTTPException
